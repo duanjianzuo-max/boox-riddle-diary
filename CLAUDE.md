@@ -1,131 +1,239 @@
 # CLAUDE.md — Development Notes
 
-Engineering notes for the Riddle Diary app (BOOX / Onyx e-ink, developed and
-tested on a **BOOX Note X2**, Android 11 / API 30, arm64). Read this before
-touching the ink/refresh pipeline — most of it is hard-won device-specific
-behavior that is not in the Onyx SDK docs.
+Engineering notes for the Riddle Diary app (BOOX / Onyx e-ink).
+
+**Target device: BOOX Note X3 Pro**, Android 12 / API 32, 1860×2480 @ ~304 PPI, arm64,
+firmware 2026-05-20.
+
+This is a fork of `billtt/boox-riddle-diary`, which was written for a **Note X2**
+(Android 11 / API 30, ~227 PPI). Several of the upstream design decisions were forced by X2
+firmware limitations that **do not apply here** — read the pen section before "simplifying"
+anything back.
+
+Upstream in turn is a port of `MaximeRivest/riddle` (Rust, reMarkable Paper Pro). Upstream
+dropped that project's memory layer; this fork restores it.
 
 ## Module layout
 
 ```
 app/src/main/java/com/billtt/riddle/
-├── MainActivity.kt      # Full-screen entry; gestures (long-press = settings); settings dialog; pen attach timing
-├── DiaryController.kt    # State machine (write→absorb→await→reveal→linger→fade); TouchHelper wiring; animation driver
-├── DiaryView.kt          # Page rendering: live ink, banded absorb cache, reply reveal; page PNG capture
-├── Oracle.kt             # Backend interface + OracleFactory + shared persona prompts
-├── AnthropicOracle.kt    # Anthropic backend (official Java SDK, Claude vision)
-├── OpenAiOracle.kt       # OpenAI backend (Chat Completions; any OpenAI-compatible endpoint via base URL)
-├── ReplyTypesetter.kt    # Reply layout: wrap, center, CJK-per-char / Western-per-word tokenization
-├── Stroke.kt             # Stroke data model
-├── EInk.kt               # EpdController wrapper (DU4 fast refresh / GC full refresh)
-└── Prefs.kt              # Provider / key / model persistence
+├── MainActivity.kt      # Full-screen entry; long-press = settings; pen attach timing
+├── DiaryController.kt   # State machine (write→absorb→await→reveal→linger→fade); TouchHelper; animations
+├── DiaryView.kt         # Page rendering: banded absorb cache, reply reveal, page PNG capture
+├── Memory.kt            # Archive: strokes + transcript + reply; recall catalog
+├── Oracle.kt            # Oracle interface, StreamParser, persona + memory protocol
+├── OpenAiOracle.kt      # Streaming Chat Completions + vision, any OpenAI-compatible endpoint
+├── ReplyTypesetter.kt   # Reply layout: wrap, center, CJK-per-char / Western-per-word
+├── Stroke.kt            # Stroke data model
+├── EInk.kt              # EpdController wrapper (DU4 fast refresh / GC full refresh)
+└── Prefs.kt             # Profiles (endpoint + persona), idle delay, memory toggle
 ```
 
-## The pen-input story (most important)
+## The pen-input story — REVERSED from upstream
 
-The single biggest device-specific finding: **on the Note X2, the Onyx pen
-callbacks (`RawInputCallback.onBeginRawDrawing` etc.) only fire in
-`FEATURE_APP_TOUCH_RENDER` mode.** The default SurfaceFlinger hardware-draw mode
-(plain `TouchHelper.create(view, callback)`) — and a `SurfaceView` host — both
-leave the callbacks silent under this firmware (you see `RawInputReader: Empty
-region detected when mapping` and `nativeRawReader` starts, but no callbacks).
-The system Notes app can hardware-draw ink because it uses a system-level path
-that is not reachable through the public `onyxsdk-pen` API.
+Upstream's central finding was that on the **Note X2**, `RawInputCallback` only fires in
+`FEATURE_APP_TOUCH_RENDER` mode, that the hardware-draw mode is silent, and therefore that
+live ink must be drawn in software. Its notes end by saying hardware-latency ink "would need
+a lower-level Onyx path … beyond `onyxsdk-pen`".
 
-Consequences baked into the current design:
+**That is not true on the Note X3 Pro.** Measured with a standalone probe (`../penprobe`):
 
-- **`TouchHelper.create(view, TouchHelper.FEATURE_APP_TOUCH_RENDER, callback)`** —
-  this is the only mode that delivers pen points here. Do not "simplify" it back
-  to the default create overload or a SurfaceView host; ink stops working.
-- **No hardware live ink.** In app-render mode Onyx does not draw the ink itself.
-  `EpdController.lineTo/quadTo` were also tried and did **not** paint on this
-  device. So live ink during writing is drawn in **software**: `DiaryView`
-  accumulates the in-progress stroke and, throttled (`LIVE_THROTTLE_MS`), does a
-  **local** `invalidate(rect)` over just the new segment's bounding box. This is
-  slightly behind the pen (e-ink software limit) but it is the only "ink appears
-  as you write" path available.
-- **Attach timing:** attach `TouchHelper` only after the window has focus
-  (`onWindowFocusChanged`), so the view's on-screen position is final. Attaching
-  before focus contributes to the empty-region problem.
+```
+create(view, FEATURE_ALL_TOUCH_RENDER, cb, false) + setRawDrawingRenderEnabled(false)
+  -> hardware live ink AND full callbacks
+  -> 491 Hz average sample rate, pressure 0..4095, tilt populated, hover delivered
+```
+
+So this fork lets **the pen chip paint the stroke** and only persists points, committing on
+pen-up. The per-move software redraw (`addLivePoint`, throttled partial `invalidate`) is
+gone — it was ~22 redraws/s over 1860×2480.
+
+Things that will silently break this if you touch them:
+
+- **`setRawDrawingRenderEnabled(false)` means the CHIP renders.** The naming is inverted.
+  `true` hands rendering back to the app, i.e. back to the slow path.
+- **`onResume()` must also pass `false`.** Upstream passed `true` there; leaving that would
+  drop you back to software rendering after every screen-off, with no other symptom.
+- **`openRawDrawing()` resets the chip**, so stroke width / style / colour are applied
+  *after* it, not only before.
+- **Configure off the main thread.** The probe validated the sequence on a dedicated thread.
+- **Attach only after the window has focus** (`onWindowFocusChanged`), so the view's
+  on-screen position is final. This one *is* inherited from upstream and still holds.
+
+`onBeginRawDrawing` reports `success=false` on this firmware even when everything works.
+Do not treat it as an error signal.
+
+Known unresolved, both measured by the probe:
+
+- `onEndRawDrawing` → `onPenUpRefresh` averages **541 ms**. Not yet tuned.
+- Light touches are frequently classified as *erasing* (`onBeginRawErasing` at pressure
+  220–361). Expect accidental erases until this is filtered.
+- `TouchPoint.getToolType` is **not exposed** here, so pen vs eraser can only be told from
+  which callback family fires.
+
+## Physical units, not X2 pixels
+
+Upstream hardcoded pixel constants that were correct at 227 PPI and wrong here. These are
+now derived from `displayMetrics.xdpi`:
+
+- stroke width — 0.5 mm (was a flat `4.5f`)
+- eraser radius — 2.7 mm (was a flat `24f`)
+- pressure ceiling — `EpdController.getMaxTouchPressure()` (was a hardcoded `4096f`;
+  the real value here is 4095)
+
+`DiaryController.FRAME_MS = 130` is still an X2-era constant, chosen for DU4 at ~150 ms on a
+smaller panel. **Not yet re-measured on this device.**
 
 ## Refresh / animation pipeline
 
-E-ink refresh is slow (high-quality GU is ~300ms), so naïve per-frame gradients
-stutter. The pipeline:
+E-ink refresh is slow, so naïve per-frame gradients stutter. The pipeline:
 
-- **DU4 fast refresh** as the view's default update mode during animation
-  (`EInk.beginAnimation` → `EpdController.setViewDefaultUpdateMode(view, DU4)`,
-  ~150ms). Refresh a frame with a plain `view.invalidate()` (triggers `onDraw`);
-  do **not** use `EpdController.postInvalidate` — it refreshes the ink layer
-  without triggering `onDraw`, so nothing you drew appears.
-- **Ink levels quantized to 5 steps** (`quantizeAlpha`) to match DU4 and avoid
-  meaningless sub-step redraws.
-- **Change-gated frames:** `runStagedFade` scans the timeline with a fine sample
-  step (`SAMPLE_MS`) but only issues a real refresh when some element crosses a
-  quantization step. Dead frames are skipped; every refresh is a visible jump.
+- **DU4 fast refresh** as the view's default update mode during animation. Refresh a frame
+  with a plain `view.invalidate()`; do **not** use `EpdController.postInvalidate` — it
+  refreshes the ink layer without triggering `onDraw`, so nothing you drew appears.
+- **Ink levels quantized to 5 steps** to match DU4.
+- **Change-gated frames:** `runStagedFade` samples the timeline finely but only refreshes
+  when an element crosses a quantization step. Dead frames are skipped.
 - **GC full refresh** once at the end of a cycle to clear ghosting.
+- **Absorb** splits strokes into bands, renders each into a bounding-box sized bitmap, and
+  fades them. Cost scales with ink, not page size — which is why the 1.75× pixel count
+  matters less here than expected. `ABSORB_BAND_STAGGER_MS` is 0, so the page fades as one;
+  upstream staggered it to drain head-to-tail, which reads as being eaten line by line.
 
-### Absorb animation (offscreen banded cache)
+This firmware exposes more modes than upstream used: `DU4`, `GU_FAST`, `GC4`, `REGAL`,
+`REGAL_D`, `REGAL_PLUS`, `ANIMATION_X`, `DU_QUALITY`, `HAND_WRITING_REPAINT_MODE`.
 
-Redrawing hundreds of stroke segments per frame is what made absorption stutter.
-Instead, `prepareAbsorb()` splits strokes **in write order** into `ABSORB_BANDS`
-bands, renders each band into a small bitmap (bounding-box sized), and the fade
-staggers the bands. Each frame then draws only a few bitmaps. This keeps the
-"absorbed head-to-tail" ordering while making the redraw cost trivial. Reply
-reveal/fade uses `drawText` directly (few elements, already cheap).
+## Oracle: one call, two products
 
-Tuning knobs live in `DiaryController.companion` (`FRAME_MS`, `SAMPLE_MS`,
-`FADE_MS`, `ABSORB_BAND_FADE_MS`, `ABSORB_BAND_STAGGER_MS`, `REVEAL_WORD_MS`,
-`lingerMillisFor`) and `DiaryView.ABSORB_BANDS`.
+A single streaming vision call returns **both** the reply and a transcription, using the
+upstream Rust project's protocol:
 
-## Backends
+- The reply is prose. Then a line beginning `⁂` carries a verbatim transcription of what was
+  written on the page. A trailing marked line is far more reliable with vision models than
+  asking for JSON, which they routinely malform.
+- `⟦show:N⟧` as the *entire* reply means "conjure catalog page N" instead of answering.
+- `StreamParser` consumes the **running** full text and emits `Ink` / `Show` / `Transcript`
+  events exactly once each, so the diary can start writing before the model finishes.
 
-`OracleFactory.create(prefs)` returns an `Oracle` for the selected provider, or
-`null` if that provider's key is unset. Both backends send the page PNG plus the
-shared persona/instruction from `OraclePrompts`. The OpenAI backend uses raw
-OkHttp + `org.json` (no OpenAI SDK) so it works against any OpenAI-compatible
-endpoint via a configurable base URL. The request intentionally sets **no**
-token-limit parameter (avoids the `max_tokens` vs `max_completion_tokens`
-incompatibility across models/gateways); reply length is bounded by the prompt.
+`StreamParser.sentenceCut` diverges from upstream deliberately: upstream only breaks on
+`. ! ? …` **and requires following whitespace**, which never fires on Chinese, where `。！？`
+are not followed by a space. CJK enders therefore terminate a sentence on their own, while
+Latin enders keep the whitespace guard that stops "Dr. Smith" splitting.
+
+The persona instructs a **mixed Chinese/English** reply mirroring the writer's own mix,
+rather than upstream's "reply in the same language".
+
+Only one backend remains: any OpenAI-compatible endpoint. Settings hold several profiles,
+each pairing an endpoint with its own persona (blank persona = OraclePrompts.PERSONA). The
+Anthropic-specific backend and the `anthropic-java` dependency were removed — Claude is
+still reachable through its own OpenAI-compatible endpoint.
+
+## Memory
+
+`Memory.kt`, ported from the upstream Rust `memory.rs` that billtt's port dropped.
+
+```
+<getExternalFilesDir>/memories/
+  index.tsv      id \t transcript \t reply   (tabs/newlines/backslashes escaped)
+  <id>.strokes   one line per stroke: "x,y,p;x,y,p;…"
+```
+
+Strokes rather than a PNG, so a recalled page is **redrawn in the writer's own hand**. Points
+within 3 px of the last kept one are dropped (`MIN_POINT_DIST2`), which shrinks files
+several-fold without visibly changing the handwriting. Keeps the newest 400 pages.
+
+Each turn sends a **freshly numbered** catalog (newest first). The numbers are reassigned
+every turn and the prompt forbids reusing a number from an earlier turn — that is what stops
+the model citing a stale index. `catalogIds[i]` resolves catalog number `i+1`.
+
+Search is conversational: there is no search UI. The writer asks the diary.
 
 ## Build
 
-Needs Android Studio, or JDK 17 + Android SDK 34 (`compileSdk 34`, `minSdk 28`).
+JDK 17–21 + Android SDK 34. **JDK 25 will not work** (Gradle 8.7 / AGP 8.5.2 cap at 21).
 
-- **Onyx SDK** comes from the official Maven repo
-  `http://repo.boox.com/repository/maven-public/` (declared in `settings.gradle`
-  with `allowInsecureProtocol`). Versions: `onyxsdk-pen:1.5.4`,
-  `onyxsdk-device:1.3.5`. (The demo's older `1.4.11`/`1.2.29` also work for input
-  but `1.5.4` was used during device debugging.)
-- **Jetifier is required** (`android.enableJetifier=true`): `onyxsdk-device:1.3.5`
-  pulls in the legacy Android Support Library, which collides with AndroidX
-  without it.
-- **jniLibs conflict:** `onyxsdk-pen` and its `mmkv` dependency both ship
-  `libc++_shared.so`; `packagingOptions.jniLibs.pickFirsts` resolves it.
+Point `local.properties` at your own SDK (`sdk.dir=...`); it is gitignored.
 
-```bash
-./gradlew assembleDebug   # or Run from Android Studio
-```
+If `./gradlew` cannot fetch its distribution (some networks fail on the
+services.gradle.org -> GitHub-assets redirect), install Gradle 8.7 yourself and run
+`gradle assembleDebug` directly instead of the wrapper.
 
-`local.properties` (`sdk.dir=…`) is generated by Android Studio; for a
-command-line build point it at your own SDK.
+- **Onyx SDK** from `http://repo.boox.com/repository/maven-public/` (`allowInsecureProtocol`).
+- **Jetifier is required** (`android.enableJetifier=true`): the Onyx artifacts still pull in
+  the legacy support library, which collides with AndroidX.
+- **jniLibs conflict:** `packagingOptions.jniLibs.pickFirsts` for `libc++_shared.so`.
+- `com.onyx.android.sdk.base.data.TouchPoint` — the superclass of the `TouchPoint` you
+  actually use — lives in **`onyxsdk-baselite`**, reached transitively via `onyxsdk-base`.
+  If a field stops resolving, check that artifact is still on the classpath. Do **not**
+  hand-write a replacement class: it would shadow the real 43-method one and break the SDK
+  at runtime.
 
-## Install & debug on the device
+## Install & debug
 
-- **BOOX auto-freeze:** newly installed apps are frozen by the launcher's
-  optimization (EAC). After `adb install`, run `adb shell pm enable
-  com.billtt.riddle` before `am start`, or the activity launch fails with
-  "Activity … does not exist".
-- **Logs:** the controller logs under tag `RiddleDiary` (attach state, pen
-  begin/end). `adb logcat -s RiddleDiary`.
-- **USB debugging** must be enabled on the device (Settings → About → tap build
-  number; then enable USB debugging and authorize the host).
+- **BOOX auto-freeze (EAC):** newly installed apps are disabled by the launcher's
+  optimization — `dumpsys package` shows `enabled=3`. After `adb install`, run
+  `adb shell pm enable com.billtt.riddle` or the launch fails with "Activity … does not
+  exist". Also, launching immediately after install races `killAppForConfigChange`; wait a
+  beat and relaunch.
+- **Logs:** `adb logcat -s RiddleDiary`.
+- Screenshots: use `adb exec-out screencap -p > f.png`. Note the pen chip's hardware ink
+  bypasses SurfaceFlinger, so **live ink does not appear in a screenshot** — only committed
+  software-drawn strokes do.
 
-## Notes / possible future work
+## Interaction
 
+- Long-press with a finger opens settings.
+- **Two-finger tap sends the page immediately**, bypassing the idle wait. Not a double-tap:
+  a resting hand produces stray single-finger events far too easily.
+- Idle delay is a setting (`Prefs.idleMs`, default 1500 ms), not the upstream constant.
+
+## Security decisions
+
+Hardening applied after an external review of a sibling fork; most findings were inherited
+from upstream and applied here too.
+
+- **The Onyx Maven repo is https.** Upstream declared it `http://` with
+  `allowInsecureProtocol = true`, which makes every artifact that ends up executing in the
+  APK MITM-able. The host serves https with a valid certificate — upstream simply never
+  checked. Verified: 200, valid chain.
+- **The Gradle distribution is pinned** with `distributionSha256Sum`, checked against the
+  official published checksum.
+- **The API key is encrypted at rest** (`Secret.kt`) with an AES-256-GCM key held in the
+  Android Keystore, non-exportable, destroyed on uninstall. Values are prefixed `enc:v1:`;
+  a value without the prefix is legacy plaintext, returned as-is and rewritten encrypted on
+  first load, so an already-working key survives the upgrade.
+- **Backup keeps the diary, drops the key.** `allowBackup` stays true — losing the archive
+  on a device migration would be worse than the backup risk — but backup rules exclude
+  `shared_prefs/riddle.xml`, which Auto Backup would otherwise sweep into the cloud.
+- **The settings dialog sets `FLAG_SECURE`**, keeping the key out of screenshots, screen
+  recordings and the recents thumbnail.
+- **In-flight requests are genuinely cancellable.** `ask()` blocks, so cancelling its
+  coroutine does not stop the HTTP exchange — it still reaches the server and is still
+  billed. `Oracle.cancel()` aborts the OkHttp `Call` itself; the timeout path and
+  `onDestroy` both call it.
+- **Response size is bounded** (`MAX_REPLY_CHARS`, and `peekBody` for error bodies), so a
+  hostile or broken endpoint cannot stream until OOM.
+- **Absorb bitmaps are bounded** (`ABSORB_BUDGET_BYTES`). Band bounding boxes overlap
+  heavily on a full page; ten near-full-screen ARGB_8888 bitmaps at 1860x2480 is ~184 MB.
+  Band count now drops when ink is spread out.
+
+Note this app does **not** need `hidden_api_policy=1`. It uses `hiddenapibypass`, which is
+per-process; do not weaken the device-wide setting for it.
+
+Still open: no dependency verification metadata, no tests, no CI, `lint abortOnError false`,
+and `minifyEnabled false` for release.
+
+## Known gaps
+
+- **Hardware ink does not cover the full screen**: writing near the top registers input
+  (callbacks fire with correct coordinates) but shows no live ink. The probe reproduces it,
+  so it is not app-specific. The other three FEATURE_* render modes are untested.
+
+- Reply reveal waits for the whole stream; the sentence-at-a-time `Ink` events are collected
+  and revealed together. Incremental reveal needs `DiaryView` to append without reflowing
+  already-revealed words.
+- `ReplyTypesetter` still picks **one** typeface for the whole reply, and tokenizes the whole
+  reply as either CJK or Western. For genuinely mixed text this splits English words into
+  letters and drops the spaces. Not yet fixed.
 - Erase is whole-stroke deletion, not pixel-level.
-- The reply is font-rendered reveal, not stroke-level handwriting animation.
-- UI strings (`res/values/strings.xml`) are Chinese (the device user's language);
-  everything else — code comments and docs — is English.
-- Truly hardware-latency live ink would need a lower-level Onyx path (e.g.
-  `onyxsdk-scribble`) or system-level access beyond `onyxsdk-pen`.
+- UI strings are Chinese; code and docs are English.

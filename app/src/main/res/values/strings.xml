@@ -2,15 +2,20 @@
 <resources>
     <string name="app_name">Riddle Diary</string>
     <string name="settings_title">日记设置</string>
-    <string name="settings_provider_anthropic">Anthropic (Claude)</string>
-    <string name="settings_provider_openai">OpenAI / 兼容接口</string>
-    <string name="settings_api_key_hint">Anthropic API Key (sk-ant-…)</string>
-    <string name="settings_model_hint">模型 ID（默认 claude-opus-4-8）</string>
-    <string name="settings_openai_key_hint">OpenAI API Key (sk-…)</string>
-    <string name="settings_openai_model_hint">模型 ID（默认 gpt-4o-mini）</string>
-    <string name="settings_openai_base_url_hint">Base URL（默认 https://api.openai.com/v1）</string>
+    <string name="settings_name_hint">档案名称</string>
+    <string name="settings_base_url_hint">Base URL（例：https://open.bigmodel.cn/api/paas/v4）</string>
+    <string name="settings_model_hint">模型 ID（例：GLM-5.3-Flash）</string>
+    <string name="settings_key_hint">API Key</string>
+    <string name="settings_persona_hint">人设（留空＝默认的 Tom Riddle 日记本）</string>
+    <string name="settings_idle_hint">停笔几秒后自动发送（默认 1.5）</string>
+    <string name="settings_memory">记住写过的页（可让日记翻出旧页）</string>
+    <string name="settings_add_profile">新建档案</string>
+    <string name="settings_forget">忘记全部记忆</string>
+    <string name="settings_forget_confirm">将永久删除所有已保存的页面（笔迹、转写、回信）。此操作无法撤销。</string>
+    <string name="toast_forgotten">已删除全部记忆</string>
+    <string name="toast_forget_failed">删除失败，部分文件可能仍在</string>
     <string name="settings_save">保存</string>
-    <string name="settings_hint_gesture">提示：用手指长按屏幕可随时打开本设置</string>
-    <string name="toast_need_key">请先设置所选后端的 API Key（用手指长按屏幕）</string>
+    <string name="settings_hint_gesture">长按屏幕打开设置；双指轻点立刻发送</string>
+    <string name="toast_need_key">请先设置 API Key（用手指长按屏幕）</string>
     <string name="toast_not_boox">未检测到 BOOX 笔驱动，将以普通触摸模式运行（仅供开发调试）</string>
 </resources>

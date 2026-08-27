@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 28-30 (android:fullBackupContent).
+
+  The diary archive under files/ IS backed up on purpose: those pages are the point of
+  the app and losing them on a device migration would be worse than the backup risk.
+  The preferences file is excluded because it holds the API key, and Android's Auto
+  Backup otherwise sweeps SharedPreferences into cloud backup by default.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="riddle.xml" />
+</full-backup-content>

@@ -1,96 +1,160 @@
 package com.billtt.riddle
 
 import android.graphics.Paint
-
-/** One animatable unit after layout: one CJK character, or one Western word. */
-data class ReplyWord(val text: String, val x: Float, val y: Float)
-
-data class ReplyLayout(val words: List<ReplyWord>, val textSizePx: Float, val isCjk: Boolean)
+import android.graphics.Typeface
 
 /**
- * Lays the reply text out on the page: vertically starting around the top third,
- * each line horizontally centered, split per-character for CJK and per-word for
- * Western text, so each unit can be revealed / faded independently.
+ * One animatable unit after layout: a single CJK character, or one Western word.
+ * [cjk] selects the typeface at draw time — the two scripts get different hands.
+ */
+data class ReplyWord(val text: String, val x: Float, val y: Float, val cjk: Boolean)
+
+data class ReplyLayout(val words: List<ReplyWord>, val textSizePx: Float)
+
+/**
+ * Lays the reply out on the page: starting around the top third, each line centered, split
+ * per-character for CJK and per-word for Western text so every unit can be revealed or
+ * faded independently.
+ *
+ * Mixed Chinese/English is handled per *run*, not per reply. Upstream decided once, for the
+ * whole text, whether it was CJK — so a reply containing any Chinese also went down the CJK
+ * path, which walks character by character. That split English words into loose letters and,
+ * because the CJK path uses a zero-width space, ran them together. Both scripts appear in
+ * the same reply here, so the tokenizer switches script as it goes.
  */
 object ReplyTypesetter {
 
-    private fun containsCjk(text: String): Boolean =
-        text.any { c ->
-            val b = Character.UnicodeBlock.of(c)
-            b == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS ||
-                b == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_A ||
-                b == Character.UnicodeBlock.CJK_SYMBOLS_AND_PUNCTUATION ||
-                b == Character.UnicodeBlock.HIRAGANA ||
-                b == Character.UnicodeBlock.KATAKANA
-        }
+    /** One laid-out token before positioning. */
+    private data class Token(val text: String, val cjk: Boolean, val spaceBefore: Boolean)
 
-    /** Split into animation units: each CJK char is its own unit (trailing punctuation
-     *  sticks to the previous char); Western text is split on spaces. */
-    private fun tokenize(text: String, cjk: Boolean): List<String> {
-        val cleaned = text.trim().replace(Regex("\\s+"), " ")
-        if (!cjk) return cleaned.split(' ').filter { it.isNotEmpty() }
-        val tokens = mutableListOf<String>()
-        for (c in cleaned) {
-            when {
-                c == ' ' -> tokens.add("")   // line-break marker, filtered out later
-                tokens.isNotEmpty() && isTrailingPunct(c) ->
-                    tokens[tokens.size - 1] = tokens.last() + c
-                else -> tokens.add(c.toString())
-            }
-        }
-        return tokens.filter { it.isNotEmpty() }
+    private fun isCjk(c: Char): Boolean {
+        val b = Character.UnicodeBlock.of(c)
+        return b == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS ||
+            b == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_A ||
+            b == Character.UnicodeBlock.CJK_SYMBOLS_AND_PUNCTUATION ||
+            b == Character.UnicodeBlock.HALFWIDTH_AND_FULLWIDTH_FORMS ||
+            b == Character.UnicodeBlock.HIRAGANA ||
+            b == Character.UnicodeBlock.KATAKANA
     }
 
-    private fun isTrailingPunct(c: Char): Boolean =
-        c in "，。！？；：、”’）》…—,.!?;:)\"'"
+    private fun isTrailingPunct(c: Char): Boolean = c in "，。！？；：、”’）》…—,.!?;:)\"'"
 
-    fun layout(text: String, pageWidth: Int, pageHeight: Int, paint: Paint): ReplyLayout {
-        val cjk = containsCjk(text)
+    /**
+     * Split into animation units, switching script mid-string.
+     *
+     * CJK characters become their own unit, with trailing punctuation glued to the character
+     * it follows. Runs of non-CJK, non-space characters stay whole as words. A word gets a
+     * leading space when the source had one; between a CJK character and a Latin word we add
+     * one anyway, which is the usual convention and keeps "写了 essay 之后" from colliding.
+     */
+    private fun tokenize(text: String): List<Token> {
+        val cleaned = text.trim().replace(Regex("\\s+"), " ")
+        val tokens = mutableListOf<Token>()
+        var i = 0
+        var pendingSpace = false
+        while (i < cleaned.length) {
+            val c = cleaned[i]
+            when {
+                c == ' ' -> { pendingSpace = true; i++ }
+                isCjk(c) -> {
+                    // Punctuation after a CJK char rides along, so it never starts a line.
+                    if (tokens.isNotEmpty() && isTrailingPunct(c) && !pendingSpace) {
+                        val last = tokens.removeAt(tokens.size - 1)
+                        tokens.add(last.copy(text = last.text + c))
+                    } else {
+                        tokens.add(Token(c.toString(), cjk = true, spaceBefore = pendingSpace))
+                    }
+                    pendingSpace = false
+                    i++
+                }
+                else -> {
+                    val start = i
+                    while (i < cleaned.length && cleaned[i] != ' ' && !isCjk(cleaned[i])) i++
+                    val word = cleaned.substring(start, i)
+                    // A Latin run touching CJK on its left still needs breathing room.
+                    val needsSpace = pendingSpace || tokens.lastOrNull()?.cjk == true
+                    tokens.add(Token(word, cjk = false, spaceBefore = needsSpace))
+                    pendingSpace = false
+                }
+            }
+        }
+        return tokens
+    }
+
+    /**
+     * @param paint measured with; its typeface is set per token, so pass the same paint the
+     *   view draws with and supply both faces.
+     */
+    fun layout(
+        text: String,
+        pageWidth: Int,
+        pageHeight: Int,
+        paint: Paint,
+        cjkFace: Typeface,
+        latinFace: Typeface,
+    ): ReplyLayout {
         var textSize = pageWidth / 24f
         val maxWidth = pageWidth * 0.78f
         val topStart = pageHeight * 0.30f
         val maxBottom = pageHeight * 0.85f
+        val tokens = tokenize(text)
 
         var words: List<ReplyWord>
         while (true) {
             paint.textSize = textSize
-            words = flow(tokenize(text, cjk), cjk, maxWidth, pageWidth, topStart, paint)
+            words = flow(tokens, maxWidth, pageWidth, topStart, paint, cjkFace, latinFace)
             val bottom = words.lastOrNull()?.y ?: topStart
             if (bottom <= maxBottom || textSize <= pageWidth / 40f) break
             textSize *= 0.88f
         }
-        return ReplyLayout(words, textSize, cjk)
+        return ReplyLayout(words, textSize)
     }
 
-    /** Fill line by line and horizontally center each line. */
+    /** Fill line by line and center each line horizontally. */
     private fun flow(
-        tokens: List<String>, cjk: Boolean, maxWidth: Float,
-        pageWidth: Int, topStart: Float, paint: Paint,
+        tokens: List<Token>,
+        maxWidth: Float,
+        pageWidth: Int,
+        topStart: Float,
+        paint: Paint,
+        cjkFace: Typeface,
+        latinFace: Typeface,
     ): List<ReplyWord> {
-        val spaceW = if (cjk) 0f else paint.measureText(" ")
+        paint.typeface = latinFace
+        val spaceW = paint.measureText(" ")
         val lineHeight = paint.textSize * 1.7f
-        val lines = mutableListOf<MutableList<Pair<String, Float>>>() // (token, width)
-        var line = mutableListOf<Pair<String, Float>>()
+
+        // (token, width, gap before it on this line)
+        data class Placed(val t: Token, val w: Float, val gap: Float)
+
+        val lines = mutableListOf<MutableList<Placed>>()
+        var line = mutableListOf<Placed>()
         var lineW = 0f
         for (t in tokens) {
-            val w = paint.measureText(t)
-            val extra = if (line.isEmpty()) w else w + spaceW
-            if (lineW + extra > maxWidth && line.isNotEmpty()) {
-                lines.add(line); line = mutableListOf(); lineW = 0f
+            paint.typeface = if (t.cjk) cjkFace else latinFace
+            val w = paint.measureText(t.text)
+            val gap = if (line.isEmpty() || !t.spaceBefore) 0f else spaceW
+            if (lineW + gap + w > maxWidth && line.isNotEmpty()) {
+                lines.add(line)
+                // The token starts a fresh line, so it carries no leading gap.
+                line = mutableListOf(Placed(t, w, 0f))
+                lineW = w
+                continue
             }
-            lineW += if (line.isEmpty()) w else w + spaceW
-            line.add(t to w)
+            line.add(Placed(t, w, gap))
+            lineW += gap + w
         }
         if (line.isNotEmpty()) lines.add(line)
 
         val words = mutableListOf<ReplyWord>()
         var y = topStart
         for (l in lines) {
-            val totalW = l.sumOf { it.second.toDouble() }.toFloat() + spaceW * (l.size - 1)
+            val totalW = l.sumOf { (it.w + it.gap).toDouble() }.toFloat()
             var x = (pageWidth - totalW) / 2f
-            for ((t, w) in l) {
-                words.add(ReplyWord(t, x, y))
-                x += w + spaceW
+            for (p in l) {
+                x += p.gap
+                words.add(ReplyWord(p.t.text, x, y, p.t.cjk))
+                x += p.w
             }
             y += lineHeight
         }

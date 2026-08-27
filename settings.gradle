@@ -11,11 +11,11 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // Onyx BOOX SDK 官方仓库（仅提供 http）
-        maven {
-            url 'http://repo.boox.com/repository/maven-public/'
-            allowInsecureProtocol = true
-        }
+        // Onyx BOOX SDK. Upstream declared this over http:// with allowInsecureProtocol,
+        // which makes every build artifact that ends up executing inside the APK
+        // MITM-able. The host serves https with a valid certificate, so it does not need
+        // to be an insecure channel. Verified: https returns 200 with a valid chain.
+        maven { url 'https://repo.boox.com/repository/maven-public/' }
         maven { url 'https://jitpack.io' }
     }
 }

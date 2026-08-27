@@ -44,9 +44,20 @@ class DiaryView(context: Context) : View(context) {
     var wordAlphas = FloatArray(0)
         private set
     private var replyTextSize = 0f
-    private var replyTypeface: Typeface = Typeface.SERIF
+    /** Two hands: a Chinese calligraphic face and a Latin script face, chosen per word. */
+    private val cjkFace: Typeface by lazy {
+        runCatching { resources.getFont(R.font.ma_shan_zheng) }.getOrDefault(Typeface.SERIF)
+    }
+    private val latinFace: Typeface by lazy {
+        runCatching { resources.getFont(R.font.dancing_script) }.getOrDefault(Typeface.SERIF)
+    }
 
-    var baseStrokeWidth = 4.5f
+    /**
+     * ~0.5 mm of ink. Upstream hardcoded 4.5 px, which is 0.5 mm on the Note X2's
+     * 227 PPI panel but only 0.38 mm on this 300 PPI one, so express it physically
+     * and let it come out right on both.
+     */
+    var baseStrokeWidth = resources.displayMetrics.xdpi * 0.5f / 25.4f
 
     private val inkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
@@ -70,9 +81,19 @@ class DiaryView(context: Context) : View(context) {
         /** Number of bands the absorb animation splits strokes into, in write order
          *  (more = finer ordering, a few more bitmaps drawn per frame). */
         const val ABSORB_BANDS = 10
+
+        /** Ceiling on the offscreen bitmaps the absorb animation may hold at once. */
+        const val ABSORB_BUDGET_BYTES = 48L * 1024 * 1024
     }
 
     // ------------------------------------------------------------------ strokes
+
+    /** Put a remembered page back on screen, redrawn from its own strokes. */
+    fun showStrokes(list: List<Stroke>) {
+        clearStrokes()
+        for (st in list) addStroke(st)
+        invalidate()
+    }
 
     fun addStroke(stroke: Stroke) {
         if (stroke.points.size < 2) return
@@ -134,7 +155,19 @@ class DiaryView(context: Context) : View(context) {
         finishAbsorb()
         val n = strokes.size
         if (n == 0 || width <= 0 || height <= 0) return
-        val bands = n.coerceAtMost(ABSORB_BANDS)
+
+        // Each band gets a bitmap sized to its own bounding box, and those boxes overlap
+        // heavily once ink is spread across the page -- a full page of writing makes every
+        // one of them nearly full-screen. Ten such bitmaps at 1860x2480 ARGB_8888 is ~184 MB,
+        // which is an OOM on a device like this. Bound the total and use fewer, larger bands
+        // when the ink is spread out; sparse pages still get the full count.
+        val union = RectF()
+        strokes.forEachIndexed { i, st -> if (i == 0) union.set(st.bounds) else union.union(st.bounds) }
+        val worstBandBytes =
+            (union.width().coerceIn(1f, width.toFloat()) *
+                union.height().coerceIn(1f, height.toFloat()) * 4f).toLong().coerceAtLeast(1L)
+        val affordable = (ABSORB_BUDGET_BYTES / worstBandBytes).toInt().coerceAtLeast(1)
+        val bands = n.coerceAtMost(ABSORB_BANDS).coerceAtMost(affordable)
         val perBand = (n + bands - 1) / bands
         val paint = Paint(inkPaint).apply { alpha = 255 }
         var idx = 0
@@ -196,9 +229,7 @@ class DiaryView(context: Context) : View(context) {
     // ------------------------------------------------------------------ reply
 
     fun setReply(text: String) {
-        replyTypeface = pickTypeface(text)
-        textPaint.typeface = replyTypeface
-        val layout = ReplyTypesetter.layout(text, width, height, textPaint)
+        val layout = ReplyTypesetter.layout(text, width, height, textPaint, cjkFace, latinFace)
         replyWords = layout.words
         replyTextSize = layout.textSizePx
         wordAlphas = FloatArray(replyWords.size)   // start from 0 (invisible)
@@ -208,12 +239,6 @@ class DiaryView(context: Context) : View(context) {
         replyWords = emptyList()
         wordAlphas = FloatArray(0)
         invalidate()
-    }
-
-    private fun pickTypeface(text: String): Typeface {
-        val cjk = text.any { Character.UnicodeBlock.of(it) == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS }
-        val fontRes = if (cjk) R.font.ma_shan_zheng else R.font.dancing_script
-        return runCatching { resources.getFont(fontRes) }.getOrDefault(Typeface.SERIF)
     }
 
     // ------------------------------------------------------------------ drawing
@@ -273,12 +298,12 @@ class DiaryView(context: Context) : View(context) {
     private fun drawReply(canvas: Canvas) {
         if (replyWords.isEmpty()) return
         textPaint.textSize = replyTextSize
-        textPaint.typeface = replyTypeface
         for (i in replyWords.indices) {
             val alpha = quantizeAlpha(wordAlphas[i])
             if (alpha <= 0.02f) continue
             textPaint.alpha = (alpha * 255).toInt()
             val w = replyWords[i]
+            textPaint.typeface = if (w.cjk) cjkFace else latinFace
             canvas.drawText(w.text, w.x, w.y, textPaint)
         }
     }

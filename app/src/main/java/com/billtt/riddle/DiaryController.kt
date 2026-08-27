@@ -1,9 +1,11 @@
 package com.billtt.riddle
 
 import android.app.Activity
+import android.graphics.Color
 import android.graphics.Rect
 import android.util.Log
 import android.widget.Toast
+import com.onyx.android.sdk.api.device.epd.EpdController
 import com.onyx.android.sdk.pen.RawInputCallback
 import com.onyx.android.sdk.pen.TouchHelper
 import com.onyx.android.sdk.data.note.TouchPoint
@@ -18,14 +20,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import java.util.concurrent.Executors
 
 /**
  * State machine: writing -> ink absorption -> awaiting reply -> reply reveal ->
  * linger -> reply fade -> writing.
  *
- * During writing, pen points arrive via TouchHelper (app-render mode; see attach())
- * and are drawn live in software by DiaryView. When idle is detected the raw pen is
- * disabled and the fade animations run via DiaryView + e-ink DU4 fast refresh.
+ * During writing the pen chip paints the stroke itself (hardware raw render; see
+ * attach()) and we only persist points, committing the stroke on pen-up. When idle is
+ * detected the raw pen is disabled and the fade animations run via DiaryView + DU4.
  */
 class DiaryController(
     private val activity: Activity,
@@ -40,6 +43,9 @@ class DiaryController(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var touchHelper: TouchHelper? = null
+
+    /** TouchHelper configuration must not run on the main thread; see attach(). */
+    private val penSetupThread = Executors.newSingleThreadExecutor { r -> Thread(r, "pen-setup") }
     private var cycleJob: Job? = null
     @Volatile private var skipLingerRequested = false
 
@@ -47,12 +53,40 @@ class DiaryController(
     // fallback on pen-up if the full point list wasn't delivered).
     private val pendingPoints = ArrayList<StrokePoint>()
 
+    /** True between onBeginRawDrawing and onEndRawDrawing: the nib is down, writing. */
+    @Volatile private var strokeInFlight = false
+
+    /** True between onBeginRawErasing and onEndRawErasing. Diagnostic only for now. */
+    @Volatile private var erasingSincePenDown = false
+
+    /**
+     * Whether the SDK delivered the authoritative point list for the CURRENT stroke.
+     *
+     * Upstream gated its pen-up fallback on `view.strokes.isEmpty()`, which is only true for
+     * the very first stroke on a page. From the second stroke onward, any stroke whose point
+     * list failed to arrive was silently dropped. Tracking it per stroke fixes that.
+     */
+    @Volatile private var listDeliveredThisStroke = false
+
     private val idleRunnable = Runnable { onIdle() }
+
+    /** The oracle serving the current cycle, so an in-flight HTTP call can be aborted. */
+    @Volatile private var activeOracle: Oracle? = null
+
+    /** Strokes, transcript and reply of every finished turn; also the recall catalog. */
+    private val memory = MemoryStore.open(activity)
 
     // ------------------------------------------------------------- lifecycle
 
     /** Call after the view is laid out; if the size is still 0, defer until layout completes. */
     fun attach() {
+        // Any later resize invalidates the chip's mapped region, so re-bind on it.
+        view.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            if (v.width > 0 && v.height > 0 && (v.width != boundW || v.height != boundH)) {
+                Log.i(TAG, "layout changed to ${v.width}x${v.height}, re-binding pen")
+                bindPen()
+            }
+        }
         if (view.width == 0 || view.height == 0) {
             Log.i(TAG, "attach: view not laid out yet (${view.width}x${view.height}), deferring")
             view.addOnLayoutChangeListener(object : android.view.View.OnLayoutChangeListener {
@@ -68,27 +102,76 @@ class DiaryController(
             })
             return
         }
+        bindPen()
+        EInk.beginAnimation(view)
+    }
+
+    private var boundW = 0
+    private var boundH = 0
+
+    /** Create and configure the TouchHelper for the view's CURRENT geometry. */
+    private fun bindPen() {
+        if (view.width <= 0 || view.height <= 0) return
+        val loc = IntArray(2)
+        view.getLocationOnScreen(loc)
+        boundW = view.width
+        boundH = view.height
+        runCatching { touchHelper?.closeRawDrawing() }
         val limit = Rect(0, 0, view.width, view.height)
+        val strokeWidth = view.baseStrokeWidth
         val ok = runCatching {
-            // On this device only the app-render mode (FEATURE_APP_TOUCH_RENDER) delivers
-            // pen-point callbacks; the default SurfaceFlinger hardware-draw mode does not
-            // fire callbacks under this firmware. Live ink during writing is therefore
-            // drawn in software by DiaryView (see the move callback / addLivePoint).
-            touchHelper = TouchHelper.create(view, TouchHelper.FEATURE_APP_TOUCH_RENDER, rawCallback)
-                .setStrokeWidth(view.baseStrokeWidth)
-                .setStrokeStyle(TouchHelper.STROKE_STYLE_PENCIL)
-                .setLimitRect(limit, ArrayList())
-                .openRawDrawing()
-            touchHelper?.setRawInputReaderEnable(true)
-            touchHelper?.setRawDrawingRenderEnabled(true)
-            touchHelper?.setRawDrawingEnabled(true)
+            // Upstream used FEATURE_APP_TOUCH_RENDER with setRawDrawingRenderEnabled(true),
+            // i.e. the app draws live ink in software, because on the author's Note X2
+            // firmware the hardware-draw mode delivered no callbacks at all.
+            //
+            // That is NOT true here. Measured on this Note X3 Pro (A12/API 32, firmware
+            // 2026-05-20) with a standalone probe: FEATURE_ALL_TOUCH_RENDER combined with
+            // setRawDrawingRenderEnabled(false) gives hardware live ink AND full callbacks
+            // (491 Hz, 4095-step pressure, tilt populated). So the pen chip paints the
+            // stroke and we only persist it on pen-up -- no per-move software redraw.
+            //
+            // Note openRawDrawing() resets the chip, so stroke params are applied after it.
+            touchHelper = TouchHelper.create(
+                view, TouchHelper.FEATURE_ALL_TOUCH_RENDER, rawCallback, false
+            )
+            // EVERY configuration call runs on the pen thread, in exactly this order.
+            // Splitting the chain -- openRawDrawing() on the main thread, the rest off it --
+            // makes create() report success while no callback ever fires. That is the
+            // failure mode this ordering exists to avoid, so do not "tidy" it back inline.
+            penSetupThread.execute {
+                runCatching {
+                    touchHelper?.apply {
+                        setStrokeWidth(strokeWidth)
+                        enableFingerTouch(false)
+                        onlyEnableFingerTouch(false)
+                        setStrokeColor(Color.BLACK)
+                        setLimitRect(limit, ArrayList())
+                        openRawDrawing()                    // resets the chip
+                        setStrokeStyle(TouchHelper.STROKE_STYLE_PENCIL)
+                        setStrokeWidth(strokeWidth)         // re-applied: openRawDrawing reset it
+                        setStrokeColor(Color.BLACK)
+                        setRawDrawingRenderEnabled(false)   // false = the chip renders
+                        setRawDrawingEnabled(true)
+                    }
+                    Log.i(TAG, "pen configured on ${Thread.currentThread().name}")
+                }.onFailure { Log.e(TAG, "pen config failed", it) }
+            }
+            true
         }.isSuccess
-        Log.i(TAG, "attach: limit=$limit touchHelper=${if (touchHelper != null) "ok" else "null"} ok=$ok")
+        Log.i(TAG, "bindPen: limit=$limit onScreen=${loc[0]},${loc[1]} " +
+            "touchHelper=${if (touchHelper != null) "ok" else "null"} ok=$ok")
         if (!ok) {
             touchHelper = null
             Toast.makeText(activity, R.string.toast_not_boox, Toast.LENGTH_LONG).show()
         }
-        EInk.beginAnimation(view)
+    }
+
+    /** Run a TouchHelper call on the pen thread; never touch the chip from the main thread. */
+    private fun onPen(block: TouchHelper.() -> Unit) {
+        val h = touchHelper ?: return
+        penSetupThread.execute {
+            runCatching { h.block() }.onFailure { Log.e(TAG, "pen op failed", it) }
+        }
     }
 
     /** Resume writing: re-enable raw pen input, only in the writing state. Called when the
@@ -96,18 +179,24 @@ class DiaryController(
     fun onResume() {
         Log.i(TAG, "onResume: state=$state touchHelper=${touchHelper != null}")
         if (state == State.WRITING) {
-            touchHelper?.setRawDrawingRenderEnabled(true)
-            touchHelper?.setRawDrawingEnabled(true)
+            // false keeps the chip rendering; true would silently drop us back to the
+            // software path this port exists to get rid of.
+            onPen {
+                setRawDrawingRenderEnabled(false)
+                setRawDrawingEnabled(true)
+            }
         }
     }
 
     fun onPause() {
-        touchHelper?.setRawDrawingEnabled(false)
+        onPen { setRawDrawingEnabled(false) }
         view.removeCallbacks(idleRunnable)
     }
 
     fun onDestroy() {
+        activeOracle?.cancel()
         runCatching { touchHelper?.closeRawDrawing() }
+        penSetupThread.shutdown()
         scope.cancel()
     }
 
@@ -127,6 +216,56 @@ class DiaryController(
         }
     }
 
+    /**
+     * Send the page now, without waiting out the idle delay. Bound to a two-finger tap.
+     * Ignored unless we are writing and there is something on the page.
+     */
+    fun triggerNow(): Boolean {
+        if (state != State.WRITING || view.strokes.isEmpty()) return false
+        view.removeCallbacks(idleRunnable)
+        Log.i(TAG, "manual trigger: strokes=${view.strokes.size}")
+        startCycle()
+        return true
+    }
+
+    /**
+     * Collects one turn's streamed events. Written on the oracle's IO thread and read on
+     * the main thread, so every access is guarded: cancelling a turn does not stop the
+     * blocking HTTP call instantly, and an unguarded read could observe a torn state.
+     */
+    private class TurnResult {
+        private val ink = StringBuilder()
+        private var transcript = ""
+        private var recallId: Long? = null
+        private var failure: String? = null
+
+        data class Snapshot(
+            val reply: String,
+            val transcript: String,
+            val recallId: Long?,
+            val failure: String?,
+        )
+
+        @Synchronized
+        fun accept(event: OracleEvent) {
+            when (event) {
+                is OracleEvent.Ink -> {
+                    if (ink.isNotEmpty()) ink.append(' ')
+                    ink.append(event.text)
+                }
+                is OracleEvent.Transcript -> transcript = event.text
+                is OracleEvent.Show -> recallId = event.id
+                is OracleEvent.Failed -> failure = event.message
+            }
+        }
+
+        @Synchronized
+        fun snapshot() = Snapshot(ink.toString(), transcript, recallId, failure)
+    }
+
+    /** Delete every remembered page. See MemoryStore.forgetAll. */
+    fun forgetAllMemories(): Boolean = memory.forgetAll()
+
     /** Any touch during the linger phase makes the reply fade early. */
     fun requestSkipLinger() {
         if (state == State.LINGERING) skipLingerRequested = true
@@ -138,13 +277,16 @@ class DiaryController(
     private val rawCallback = object : RawInputCallback() {
 
         override fun onBeginRawDrawing(shortcut: Boolean, point: TouchPoint) {
+            strokeInFlight = true
+            listDeliveredThisStroke = false
+            Log.i(TAG, "onBeginRawDrawing (${point.x.toInt()},${point.y.toInt()}) p=${point.pressure}")
             val p = StrokePoint(point.x, point.y, normalizePressure(point.pressure))
             view.post {
                 view.removeCallbacks(idleRunnable)
                 pendingPoints.clear()
                 view.beginLiveStroke()
                 pendingPoints.add(p)
-                view.addLivePoint(p)
+                // No live draw: the pen chip paints this stroke itself.
             }
         }
 
@@ -152,11 +294,13 @@ class DiaryController(
             val p = StrokePoint(point.x, point.y, normalizePressure(point.pressure))
             view.post {
                 pendingPoints.add(p)
-                view.addLivePoint(p)   // live partial draw + local fast refresh
+                // Collect only: the chip already shows this stroke, so the old throttled
+                // partial-invalidate path (~22 software redraws/s) is gone.
             }
         }
 
         override fun onRawDrawingTouchPointListReceived(pointList: TouchPointList) {
+            listDeliveredThisStroke = true
             val pts = pointList.points.map {
                 StrokePoint(it.x, it.y, normalizePressure(it.pressure))
             }
@@ -167,9 +311,10 @@ class DiaryController(
         }
 
         override fun onEndRawDrawing(outLimitRegion: Boolean, point: TouchPoint) {
+            strokeInFlight = false
             Log.i(TAG, "onEndRawDrawing strokes=${view.strokes.size} pending=${pendingPoints.size}")
             view.post {
-                if (view.strokes.isEmpty() && pendingPoints.size >= 2) {
+                if (!listDeliveredThisStroke && pendingPoints.size >= 2) {
                     view.addStroke(Stroke(ArrayList(pendingPoints)))
                 }
                 pendingPoints.clear()
@@ -179,6 +324,7 @@ class DiaryController(
         }
 
         override fun onBeginRawErasing(shortcut: Boolean, point: TouchPoint) {
+            erasingSincePenDown = true
             view.post { view.removeCallbacks(idleRunnable) }
         }
 
@@ -186,27 +332,54 @@ class DiaryController(
 
         override fun onRawErasingTouchPointListReceived(pointList: TouchPointList) {
             val pts = pointList.points.map { StrokePoint(it.x, it.y, 1f) }
+
+            // This firmware fires erase callbacks spuriously in the middle of ordinary
+            // writing -- the probe logged 598 of them in one short session, with begin
+            // pressures of 220-361, interleaved with normal draw strokes. Since
+            // TouchPoint.getToolType is not exposed here, the callback family is the ONLY
+            // signal available, so an unguarded eraseAt() silently deletes what was just
+            // written. Two cheap guards, both erring towards keeping ink:
+            //   - a real erase sweeps: require enough points to be a gesture
+            //   - never erase while a drawing stroke is in flight
+            val looksDeliberate = pts.size >= MIN_ERASE_POINTS && !strokeInFlight
+            if (!looksDeliberate) {
+                Log.i(TAG, "ignored erase burst: pts=${pts.size} strokeInFlight=$strokeInFlight")
+                view.post { scheduleIdleCheck() }
+                return
+            }
             view.post {
-                if (view.eraseAt(pts, ERASER_RADIUS)) refreshAfterErase()
+                if (view.eraseAt(pts, eraserRadius)) refreshAfterErase()
                 scheduleIdleCheck()
             }
         }
 
         override fun onEndRawErasing(outLimitRegion: Boolean, point: TouchPoint) {
+            erasingSincePenDown = false
             view.post { scheduleIdleCheck() }
         }
     }
 
+    /** The probe measured 4095 on this panel, not 4096. Ask the device instead of guessing. */
+    private val maxPressure: Float by lazy {
+        runCatching { EpdController.getMaxTouchPressure() }.getOrNull()
+            ?.takeIf { it > 0f } ?: MAX_PRESSURE
+    }
+
+    /** ~2.7 mm, which is what upstream's 24 px came to on the Note X2's 227 PPI panel. */
+    private val eraserRadius: Float by lazy {
+        view.resources.displayMetrics.xdpi * 2.7f / 25.4f
+    }
+
     private fun normalizePressure(raw: Float): Float =
-        (raw / MAX_PRESSURE).coerceIn(0.05f, 1f)
+        (raw / maxPressure).coerceIn(0.05f, 1f)
 
     /** After erasing, briefly leave raw pen mode to redraw the remaining strokes and full-refresh. */
     private fun refreshAfterErase() {
-        touchHelper?.setRawDrawingEnabled(false)
+        onPen { setRawDrawingEnabled(false) }
         view.invalidate()          // redraw remaining strokes (erased ones are gone)
         EInk.fullRefresh(view)     // GC full refresh to clear ghosting of erased ink
         view.postDelayed({
-            if (state == State.WRITING) touchHelper?.setRawDrawingEnabled(true)
+            if (state == State.WRITING) onPen { setRawDrawingEnabled(true) }
         }, 300)
     }
 
@@ -215,7 +388,7 @@ class DiaryController(
     private fun scheduleIdleCheck() {
         view.removeCallbacks(idleRunnable)
         if (state == State.WRITING && view.strokes.isNotEmpty()) {
-            view.postDelayed(idleRunnable, IDLE_MS)
+            view.postDelayed(idleRunnable, prefs.idleMs)
         }
     }
 
@@ -229,19 +402,33 @@ class DiaryController(
     private fun startCycle() {
         state = State.ABSORBING
         skipLingerRequested = false
-        touchHelper?.setRawDrawingEnabled(false)
+        onPen { setRawDrawingEnabled(false) }
 
         cycleJob = scope.launch {
-            // Take over the on-screen ink with software rendering (same content as live ink).
             EInk.animateFrame(view)
             delay(FRAME_MS)
 
-            // Fire the AI request immediately, so recognition runs in parallel with the absorb animation.
+            // Snapshot the page before absorption wipes it: these strokes are what gets
+            // archived, and what a later recall redraws in the writer's own hand.
+            val written = view.strokes.toList()
             val png = withContext(Dispatchers.Default) { view.capturePagePng() }
+
+            // Fire the request first so recognition overlaps the absorb animation.
             val oracle = OracleFactory.create(prefs)
-            val replyDeferred = oracle?.let {
+            activeOracle = oracle
+            val remember = prefs.memoryEnabled
+            val ctx = if (remember) {
+                val (lines, ids) = memory.catalog(CATALOG_MAX)
+                TurnContext(memory.recentDialogue(RECENT_TURNS), lines, ids)
+            } else {
+                TurnContext()
+            }
+
+            val turn = TurnResult()
+
+            val turnDeferred = oracle?.let {
                 async(Dispatchers.IO) {
-                    runCatching { it.ask(png) }
+                    runCatching { it.ask(png, ctx, turn::accept) }
                 }
             }
 
@@ -250,38 +437,75 @@ class DiaryController(
             EInk.fullRefresh(view)
 
             state = State.AWAITING_REPLY
-            val reply: String = when {
-                replyDeferred == null -> activity.getString(R.string.toast_need_key)
-                else -> {
-                    val result = runCatching {
-                        withTimeout(REPLY_TIMEOUT_MS) { replyDeferred.await() }
-                    }.getOrNull()
-                    result?.getOrNull() ?: silentReply(result?.exceptionOrNull())
+            val unconfigured = turnDeferred == null
+            if (turnDeferred != null) {
+                val result = runCatching {
+                    withTimeout(REPLY_TIMEOUT_MS) { turnDeferred.await() }
+                }.onFailure {
+                    // ask() blocks, so cancelling the coroutine leaves the HTTP exchange
+                    // running: it still reaches the server and is still billed. Abort the
+                    // call itself, and say so rather than swallowing the timeout.
+                    oracle?.cancel()
+                    turnDeferred.cancel()
+                    reportError(it)
+                }.getOrNull()
+                result?.exceptionOrNull()?.let { reportError(it) }
+            }
+            // With no key configured the message is produced below, so that the ellipsis
+            // fallback cannot overwrite it.
+
+            // One consistent snapshot. On the timeout path the HTTP thread can still be
+            // running for a moment after cancel(), so reading the fields one by one could
+            // mix a half-written turn.
+            val snap = turn.snapshot()
+            val recalled = snap.recallId?.let { if (remember) memory.strokes(it) else null }
+            if (recalled != null) {
+                // A recall: instead of a reply, the page itself comes back, in the writer's
+                // own hand. Nothing new is archived -- this turn produced no new page.
+                state = State.REVEALING
+                view.showStrokes(recalled)
+                EInk.fullRefresh(view)
+                state = State.LINGERING
+                lingerInterruptibly(RECALL_LINGER_MS)
+                view.clearStrokes()
+                EInk.fullRefresh(view)
+            } else {
+                snap.failure?.let { Log.w(TAG, "oracle reported: $it") }
+                // Ellipsis in character: the diary heard nothing, rather than an error box.
+                // With no key configured, say so instead -- upstream set that message and
+                // then immediately overwrote it with the ellipsis.
+                val reply = when {
+                    unconfigured -> activity.getString(R.string.toast_need_key)
+                    else -> snap.reply.ifBlank { "……" }
                 }
+                state = State.REVEALING
+                view.setReply(reply)
+                animateReveal()
+
+                if (remember && written.isNotEmpty()) {
+                    val id = System.currentTimeMillis() / 1000L
+                    withContext(Dispatchers.IO) {
+                        memory.append(id, snap.transcript, reply, written)
+                    }
+                }
+
+                state = State.LINGERING
+                lingerInterruptibly(lingerMillisFor(view.replyWords.size))
+
+                state = State.FADING_REPLY
+                animateReplyFade()
+                view.clearReply()
+                EInk.fullRefresh(view)
             }
 
-            state = State.REVEALING
-            view.setReply(reply)
-            animateReveal()
-
-            state = State.LINGERING
-            lingerInterruptibly(lingerMillisFor(view.replyWords.size))
-
-            state = State.FADING_REPLY
-            animateReplyFade()
-            view.clearReply()
-            EInk.fullRefresh(view)
-
             state = State.WRITING
-            touchHelper?.setRawDrawingEnabled(true)
+            onPen { setRawDrawingEnabled(true) }
         }
     }
 
-    private fun silentReply(cause: Throwable?): String {
-        cause?.let {
-            Toast.makeText(activity, "API error: ${it.message}", Toast.LENGTH_LONG).show()
-        }
-        return "……"
+    private fun reportError(cause: Throwable) {
+        Log.e(TAG, "oracle failed", cause)
+        Toast.makeText(activity, "API error: ${cause.message}", Toast.LENGTH_LONG).show()
     }
 
     // ------------------------------------------------------------- animations
@@ -325,9 +549,12 @@ class DiaryController(
     }
 
     /**
-     * Ink absorption: split the strokes into bands in write order (offscreen bitmaps)
-     * and fade the bands out with a stagger. Keeps the "absorbed head to tail" ordering
-     * while drawing only a few bitmaps per frame — continuous and smooth.
+     * Ink absorption: the whole page fades out together, slowly and evenly.
+     *
+     * Upstream staggered the bands so the page drained head-to-tail, which reads as the ink
+     * being eaten line by line. With ABSORB_BAND_STAGGER_MS at 0 every band shares one alpha,
+     * so the banding now only serves its other purpose -- drawing a handful of cached bitmaps
+     * per frame instead of hundreds of stroke segments.
      */
     private suspend fun animateAbsorb() {
         if (view.strokes.isEmpty()) return
@@ -377,10 +604,6 @@ class DiaryController(
     companion object {
         const val TAG = "RiddleDiary"
 
-        /** How long the pen must rest to count as "a passage finished" and trigger absorption
-         *  (the original riddle project uses 2.8s). */
-        const val IDLE_MS = 2800L
-
         /** Minimum interval after each real refresh — DU4 fast refresh is ~150ms. */
         const val FRAME_MS = 130L
 
@@ -388,15 +611,32 @@ class DiaryController(
         const val SAMPLE_MS = 30L
 
         const val FADE_MS = 420L                  // reply: one word from full to 0 (or reverse)
-        const val ABSORB_BAND_FADE_MS = 300L      // absorb: one band from full down to 0
-        const val ABSORB_BAND_STAGGER_MS = 75L    // absorb: gap between adjacent bands starting to fade (ordering)
+        /** Absorb duration. Quantisation gives 5 visible steps, so ~320 ms per step here. */
+        const val ABSORB_BAND_FADE_MS = 1600L
+        /** 0 = the whole page fades as one. Non-zero drains it head-to-tail instead. */
+        const val ABSORB_BAND_STAGGER_MS = 0L
         const val ABSORB_TOTAL_STAGGER_MS = 1100L // reply fade: total stagger budget
         const val ABSORB_STAGGER_MAX_MS = 90L
 
         const val REVEAL_WORD_MS = 55L            // gap between adjacent words starting to reveal
 
         const val REPLY_TIMEOUT_MS = 150_000L
-        const val ERASER_RADIUS = 24f
+
+        /** Past pages offered to the model as a numbered recall catalog. */
+        const val CATALOG_MAX = 40
+
+        /** Earlier turns replayed as conversation, so the diary remembers what was just said. */
+        const val RECENT_TURNS = 6
+
+        /** How long a conjured page stays on screen before the diary lets it go. */
+        const val RECALL_LINGER_MS = 12_000L
+
+        /**
+         * Minimum points in an erase burst before it is believed. Tuned conservatively:
+         * losing an intended erase costs one repeated swipe, losing written ink costs the
+         * page. Revisit once real usage shows how big genuine erase bursts are.
+         */
+        const val MIN_ERASE_POINTS = 8
         const val MAX_PRESSURE = 4096f
     }
 }

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 31+. Same rule for both cloud backup and direct device-to-device transfer. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="riddle.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="riddle.xml" />
+    </device-transfer>
+</data-extraction-rules>

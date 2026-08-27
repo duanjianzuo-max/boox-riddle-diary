@@ -8,11 +8,13 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.ArrayAdapter
+import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 
@@ -55,6 +57,12 @@ class MainActivity : Activity() {
 
     private fun handleTouch(event: MotionEvent): Boolean {
         gestureDetector.onTouchEvent(event)
+        // Two fingers down at once = send this page now, without waiting out the idle delay.
+        // Deliberately not a double-tap: a single stray finger is far too easy to produce
+        // while a hand is resting on the page.
+        if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN && event.pointerCount >= 2) {
+            if (controller.triggerNow()) return true
+        }
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             controller.requestSkipLinger()
         }
@@ -85,7 +93,8 @@ class MainActivity : Activity() {
         super.onWindowFocusChanged(hasFocus)
         if (!hasFocus || !::controller.isInitialized) return
         hideSystemUi()
-        if (penAttached) controller.onResume() else tryAttachPen()
+        // hideSystemUi() requests a relayout; bind on the next frame, once it has settled.
+        if (penAttached) controller.onResume() else diaryView.post { tryAttachPen() }
     }
 
     override fun onPause() {
@@ -104,119 +113,169 @@ class MainActivity : Activity() {
             View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
             View.SYSTEM_UI_FLAG_FULLSCREEN or
             View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-            View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            // Without these two the content is laid out INSIDE the bars and then resized
+            // when they hide. The pen's limit rect is bound from that geometry, so the
+            // resize is what produced "Empty region detected when mapping" and silent
+            // callbacks. Full-bleed from the start means the geometry never moves.
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+            View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
     }
 
     // ------------------------------------------------------------- settings UI
 
     private fun showSettingsDialog() {
-        // Pause raw pen mode while settings are open, so the dialog isn't covered by the ink layer.
-        controller.onPause()
-
         val pad = (16 * resources.displayMetrics.density).toInt()
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, 0)
         }
 
-        // ---- backend selection ----
-        val anthropicRadio = RadioButton(this).apply {
-            id = View.generateViewId()
-            text = getString(R.string.settings_provider_anthropic)
-        }
-        val openaiRadio = RadioButton(this).apply {
-            id = View.generateViewId()
-            text = getString(R.string.settings_provider_openai)
-        }
-        val providerGroup = RadioGroup(this).apply {
-            orientation = RadioGroup.HORIZONTAL
-            addView(anthropicRadio)
-            addView(openaiRadio)
-        }
+        var profiles = prefs.profiles.toMutableList()
+        var current = prefs.activeIndex.coerceIn(0, profiles.size - 1)
 
-        // ---- Anthropic fields ----
-        val anthropicKeyInput = EditText(this).apply {
-            hint = getString(R.string.settings_api_key_hint)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setText(prefs.apiKey)
+        val spinner = Spinner(this)
+        val nameInput = EditText(this).apply { hint = getString(R.string.settings_name_hint) }
+        val baseUrlInput = EditText(this).apply {
+            hint = getString(R.string.settings_base_url_hint)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         }
-        val anthropicModelInput = EditText(this).apply {
+        val modelInput = EditText(this).apply {
             hint = getString(R.string.settings_model_hint)
             inputType = InputType.TYPE_CLASS_TEXT
-            setText(prefs.model)
         }
-        val anthropicFields = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(anthropicKeyInput)
-            addView(anthropicModelInput)
-        }
-
-        // ---- OpenAI fields ----
-        val openaiKeyInput = EditText(this).apply {
-            hint = getString(R.string.settings_openai_key_hint)
+        val keyInput = EditText(this).apply {
+            hint = getString(R.string.settings_key_hint)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setText(prefs.openaiKey)
         }
-        val openaiModelInput = EditText(this).apply {
-            hint = getString(R.string.settings_openai_model_hint)
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(prefs.openaiModel)
+        val personaInput = EditText(this).apply {
+            hint = getString(R.string.settings_persona_hint)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            maxLines = 8
         }
-        val openaiBaseUrlInput = EditText(this).apply {
-            hint = getString(R.string.settings_openai_base_url_hint)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(prefs.openaiBaseUrl)
+        val idleInput = EditText(this).apply {
+            hint = getString(R.string.settings_idle_hint)
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText("%.1f".format(prefs.idleMs / 1000.0))
         }
-        val openaiFields = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(openaiKeyInput)
-            addView(openaiModelInput)
-            addView(openaiBaseUrlInput)
+        val memoryToggle = CheckBox(this).apply {
+            text = getString(R.string.settings_memory)
+            isChecked = prefs.memoryEnabled
         }
 
-        val hint = TextView(this).apply {
+        fun loadInto(i: Int) {
+            val p = profiles[i]
+            nameInput.setText(p.name)
+            baseUrlInput.setText(p.baseUrl)
+            modelInput.setText(p.model)
+            keyInput.setText(p.key)
+            personaInput.setText(p.persona)
+        }
+
+        /** Pull the on-screen fields back into the profile they belong to. */
+        fun captureInto(i: Int) {
+            profiles[i] = Prefs.Profile(
+                name = nameInput.text.toString().trim().ifEmpty { "档案 ${i + 1}" },
+                baseUrl = baseUrlInput.text.toString().trim(),
+                model = modelInput.text.toString().trim(),
+                key = keyInput.text.toString().trim(),
+                persona = personaInput.text.toString().trim(),
+            )
+        }
+
+        fun refreshSpinner(select: Int) {
+            spinner.adapter = ArrayAdapter(
+                this, android.R.layout.simple_spinner_dropdown_item,
+                profiles.map { it.name },
+            )
+            spinner.setSelection(select)
+        }
+
+        refreshSpinner(current)
+        loadInto(current)
+
+        spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long,
+            ) {
+                if (position == current) return
+                captureInto(current)      // don't lose edits when switching away
+                current = position
+                loadInto(current)
+            }
+
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
+
+        val forgetButton = Button(this).apply {
+            text = getString(R.string.settings_forget)
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(R.string.settings_forget_confirm)
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .setPositiveButton(R.string.settings_forget) { _, _ ->
+                        val ok = controller.forgetAllMemories()
+                        Toast.makeText(
+                            this@MainActivity,
+                            if (ok) R.string.toast_forgotten else R.string.toast_forget_failed,
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                    .show()
+            }
+        }
+
+        val addButton = Button(this).apply {
+            text = getString(R.string.settings_add_profile)
+            setOnClickListener {
+                captureInto(current)
+                profiles.add(Prefs.Profile("档案 ${profiles.size + 1}", Prefs.DEFAULT_BASE_URL, "", "", ""))
+                current = profiles.size - 1
+                refreshSpinner(current)
+                loadInto(current)
+            }
+        }
+
+        layout.addView(spinner)
+        layout.addView(nameInput)
+        layout.addView(baseUrlInput)
+        layout.addView(modelInput)
+        layout.addView(keyInput)
+        layout.addView(personaInput)
+        layout.addView(idleInput)
+        layout.addView(memoryToggle)
+        layout.addView(addButton)
+        layout.addView(forgetButton)
+        layout.addView(TextView(this).apply {
             text = getString(R.string.settings_hint_gesture)
             textSize = 12f
             setPadding(0, pad / 2, 0, 0)
-        }
+        })
 
-        layout.addView(providerGroup)
-        layout.addView(anthropicFields)
-        layout.addView(openaiFields)
-        layout.addView(hint)
-
-        fun applyVisibility(openai: Boolean) {
-            anthropicFields.visibility = if (openai) View.GONE else View.VISIBLE
-            openaiFields.visibility = if (openai) View.VISIBLE else View.GONE
-        }
-        providerGroup.setOnCheckedChangeListener { _, checkedId ->
-            applyVisibility(checkedId == openaiRadio.id)
-        }
-        val isOpenAi = prefs.provider == Prefs.PROVIDER_OPENAI
-        providerGroup.check(if (isOpenAi) openaiRadio.id else anthropicRadio.id)
-        applyVisibility(isOpenAi)
-
-        val scroll = ScrollView(this).apply { addView(layout) }
-
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle(R.string.settings_title)
-            .setView(scroll)
+            .setView(ScrollView(this).apply { addView(layout) })
             .setPositiveButton(R.string.settings_save) { _, _ ->
-                prefs.provider = if (providerGroup.checkedRadioButtonId == openaiRadio.id) {
-                    Prefs.PROVIDER_OPENAI
-                } else {
-                    Prefs.PROVIDER_ANTHROPIC
-                }
-                prefs.apiKey = anthropicKeyInput.text.toString()
-                prefs.model = anthropicModelInput.text.toString()
-                prefs.openaiKey = openaiKeyInput.text.toString()
-                prefs.openaiModel = openaiModelInput.text.toString()
-                prefs.openaiBaseUrl = openaiBaseUrlInput.text.toString()
+                captureInto(current)
+                prefs.profiles = profiles
+                prefs.activeIndex = current
+                prefs.memoryEnabled = memoryToggle.isChecked
+                idleInput.text.toString().trim().toDoubleOrNull()
+                    ?.let { prefs.idleMs = (it * 1000).toLong() }
                 if (!prefs.configured) {
                     Toast.makeText(this, R.string.toast_need_key, Toast.LENGTH_LONG).show()
                 }
             }
             .setOnDismissListener { controller.onResume() }
-            .show()
+            .create()
+
+        // The API key is on screen in this dialog. FLAG_SECURE keeps it out of screenshots,
+        // screen recordings and the recents thumbnail.
+        dialog.window?.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE,
+        )
+        dialog.show()
     }
 }
