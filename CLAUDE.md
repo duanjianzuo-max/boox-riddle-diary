@@ -63,6 +63,19 @@ Things that will silently break this if you touch them:
 `onBeginRawDrawing` reports `success=false` on this firmware even when everything works.
 Do not treat it as an error signal.
 
+### The top-of-screen blind spot
+
+For a while the top of the page took input correctly -- callbacks fired with the right
+coordinates -- but showed no hardware ink, while the lower part worked. It went away once
+`hideSystemUi()` gained `SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN` and `LAYOUT_HIDE_NAVIGATION`
+and `bindPen()` started re-binding on layout changes.
+
+The likely mechanism is that without those flags the content is laid out *inside* the
+system bars and then resized when they hide, so the limit rect was bound from an
+intermediate geometry. That is consistent with the symptom, but it was not isolated with a
+controlled test before the behaviour changed, so treat the causal claim as probable rather
+than established. If it reappears, suspect the bind-time geometry first.
+
 Known unresolved, both measured by the probe:
 
 - `onEndRawDrawing` → `onPenUpRefresh` averages **541 ms**. Not yet tuned.
@@ -225,9 +238,15 @@ and `minifyEnabled false` for release.
 
 ## Known gaps
 
-- **Hardware ink does not cover the full screen**: writing near the top registers input
-  (callbacks fire with correct coordinates) but shows no live ink. The probe reproduces it,
-  so it is not app-specific. The other three FEATURE_* render modes are untested.
+- **The transcription postscript is unreliable.** Measured over 28 archived turns: 12 had
+  no marker line at all, so those pages carry a reply but no searchable text and cannot
+  anchor a recall. The instruction now also appears in the per-turn user message rather
+  than only at the end of a long system prompt, and StreamParser logs every miss so the
+  rate is measurable. Not yet re-measured. If it stays unreliable, the next step is a
+  marker the model reproduces more readily than U+2042.
+- Replies are longer than the persona's one-to-three-short-sentences rule -- around a
+  hundred characters in practice. Restated per turn alongside the postscript rule;
+  unverified.
 
 - Reply reveal waits for the whole stream; the sentence-at-a-time `Ink` events are collected
   and revealed together. Incremental reveal needs `DiaryView` to append without reflowing

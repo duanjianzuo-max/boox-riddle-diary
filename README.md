@@ -97,9 +97,13 @@ Build it yourself rather than trusting a debug-signed APK.
 
 ### Known issues
 
-- **Hardware ink does not cover the whole screen.** Writing near the top of the page
-  registers input correctly but shows no live ink. Under investigation; the other three
-  `FEATURE_*` render modes have not been ruled out yet.
+- **The transcription postscript is unreliable.** Across 28 archived turns the model
+  omitted the marker line on 12 of them, leaving those pages with a reply but no
+  searchable text and nothing for a later recall to match on. The instruction has been
+  moved into the per-turn user message, and misses are now logged, but the improvement
+  has not been measured yet.
+- **Replies run long.** The persona asks for one to three short sentences; observed
+  replies were nearer a hundred characters. Same fix, same caveat.
 - `onEndRawDrawing` → `onPenUpRefresh` averages ~541 ms. Not yet tuned.
 - The reply is revealed once the stream completes rather than sentence by sentence.
 - Erase is whole-stroke, not pixel-level.

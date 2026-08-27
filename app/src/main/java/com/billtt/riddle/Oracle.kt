@@ -1,5 +1,7 @@
 package com.billtt.riddle
 
+import android.util.Log
+
 /**
  * What the oracle streams back to the diary, one event at a time.
  */
@@ -153,6 +155,11 @@ class StreamParser(private val catalogIds: List<Long>) {
             if (sentinel >= 0) {
                 val t = full.subSequence(sentinel + SENTINEL.length, full.length).toString().trim()
                 if (t.isNotEmpty()) out.add(OracleEvent.Transcript(t))
+                else Log.w(TAG, "postscript marker present but transcription empty")
+            } else {
+                // Measurable rather than silent: this is the model ignoring the protocol,
+                // and it costs the archive the searchable text for that page.
+                Log.w(TAG, "no transcription postscript in reply (" + full.length + " chars)")
             }
             if (!emittedAny) out.add(OracleEvent.Failed("empty reply"))
         }
@@ -160,6 +167,8 @@ class StreamParser(private val catalogIds: List<Long>) {
     }
 
     companion object {
+        private const val TAG = "RiddleDiary"
+
         const val SENTINEL = "⁂"      // the transcription postscript marker
         const val SHOW_OPEN = "⟦"
         const val SHOW_CLOSE = "⟧"
@@ -285,9 +294,25 @@ object OraclePrompts {
         yours with one.
     """.trimIndent()
 
-    const val USER_INSTRUCTION =
-        "This image is the current page of the diary, just written by hand. " +
-            "Read the handwriting and write the diary's reply."
+    /**
+     * Restates the two rules that matter most, in the per-turn user message.
+     *
+     * Both were already in the system prompt, and both were being ignored in practice: on a
+     * sample of 28 turns the transcription postscript was missing from 12 of them, and
+     * replies ran to roughly a hundred characters rather than the one to three sentences
+     * asked for. The system prompt is long and these instructions sat at the end of it,
+     * furthest from the point of generation. Repeating them here puts them last.
+     */
+    val USER_INSTRUCTION = """
+        This image is the current page of the diary, just written by hand.
+
+        Write the diary's reply: one to three SHORT sentences, no more.
+
+        Then, on a new line, write ${StreamParser.SENTINEL} followed by a word-for-word
+        transcription of what the writer wrote on this page — their words only, one line, no
+        commentary, keeping their original mix of Chinese and English. Do not translate.
+        This ${StreamParser.SENTINEL} line is required on every reply, without exception.
+    """.trimIndent()
 
     /** The turn's text part: the memory catalog, then the instruction. */
     fun turnText(ctx: TurnContext): String =
